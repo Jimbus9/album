@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": ".test-build",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "noEmit": false
+  },
+  "include": ["src/engine/**/*.ts", "src/examples.ts", "src/links.ts"]
+}
