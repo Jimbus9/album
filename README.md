@@ -10,13 +10,16 @@ Cards are issuer-signed Nostr-format events. The card engine in `src/engine/` is
 - Every card's signature is checked each time it is shown.
 - Cards from an issuer you haven't trusted, or given to a key that isn't yours, wait until you decide.
 - Decks by issuer; card front and back; withdrawn-card lists.
-- One card key per issuer, made on the phone.
-- Backup file of everything, including card keys; load it to replace.
+- **Recovery words.** On first open Album makes 12 words (or takes yours). Every card key comes from them by NIP-06 (card key n = account n), so the words alone bring every key back. After a restore, a card arriving for one of those keys is recognised and its key re-made.
+- **Passcode.** The cards, keys and words are stored encrypted with it (PBKDF2-SHA256, 600,000 rounds, then AES-256-GCM, from the browser's WebCrypto). Album locks after five minutes out of sight. Forgot the passcode: start again from the words.
+- One card key per issuer, so issuers can't link your cards.
+- Backup file of every card, encrypted with a key from the recovery words: only the words open it.
 - Example cards to try it.
 
 ## Not yet
 
-- Storage is not encrypted. Anyone who can open Album on the phone can see the cards.
+- Keys made before the recovery words existed (earlier builds) can't be recovered from the words.
+- No fingerprint unlock yet: passcode only.
 - Apps can't ask for cards yet. The plug (`src/engine/plug.ts`) is built; the way another app reaches Album is not.
 - Empty slots for cards not yet earned need a public catalogue from the issuer. Not built.
 - Showing or hiding who issued a card isn't in the engine yet.

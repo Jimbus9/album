@@ -1,7 +1,10 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "DOM"],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
     "module": "commonjs",
     "moduleResolution": "node",
     "strict": true,
@@ -9,7 +12,21 @@
     "outDir": ".test-build",
     "rootDir": "src",
     "esModuleInterop": true,
-    "noEmit": false
+    "noEmit": false,
+    "baseUrl": ".",
+    "paths": {
+      "nostr-tools/nip06": [
+        "node_modules/nostr-tools/lib/types/nip06.d.ts"
+      ],
+      "@scure/bip39/wordlists/english.js": [
+        "node_modules/@scure/bip39/wordlists/english.d.ts"
+      ]
+    }
   },
-  "include": ["src/engine/**/*.ts", "src/examples.ts", "src/links.ts"]
+  "include": [
+    "src/engine/**/*.ts",
+    "src/examples.ts",
+    "src/links.ts",
+    "src/vault.ts"
+  ]
 }

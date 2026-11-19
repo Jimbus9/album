@@ -61,3 +61,6 @@ nav.tabs button[aria-current="page"]{color:var(--ink);font-weight:600}
 video.scan{width:100%;border-radius:12px;background:#000;aspect-ratio:1/1;object-fit:cover}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 :focus-visible{outline:3px solid var(--link);outline-offset:2px}
+.words{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;counter-reset:w}
+.words li{counter-increment:w;display:flex;gap:10px;align-items:baseline;padding:10px 12px;background:var(--paper);border-radius:8px;font-family:var(--mono);font-size:15px}
+.words li::before{content:counter(w);color:var(--soft);font-size:12px;min-width:18px}

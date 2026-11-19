@@ -19,10 +19,10 @@ const CARDS: { slug: string; definition: Omit<CardDefinition, keyof typeof base>
   { slug: "founding-member", definition: { title: "Founding Member", description: "One of the first 1,000 locks on the example register.", criteria: "Be among the first 1,000 locks." }, claim: "17 of 1,000" },
 ];
 
-export function withExampleCards(state: HolderState, nowIso: string): HolderState {
+/** `holder` is the card key the example cards are given to; Album passes one worked out from the recovery words. */
+export function withExampleCards(state: HolderState, nowIso: string, holder = generateKey()): HolderState {
   const now = Math.floor(Date.parse(nowIso) / 1000);
   const issuer = generateKey();
-  const holder = generateKey();
   let next = addKey(state, EXAMPLE_ISSUER, holder, nowIso);
   CARDS.forEach((item, index) => {
     const definition = createDefinition(issuer.secretKey, item.slug, { ...base, ...item.definition }, now);

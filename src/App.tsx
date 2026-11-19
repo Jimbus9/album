@@ -1,43 +1,72 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { emptyHolder, parseHolder, type HolderState } from "./engine/schema";
-import { generateKey, packCard } from "./engine/protocol";
-import { acceptCard, addKey, decks, importFile, removeCard, untrustIssuer, viewCards, type CardView, type ImportOutcome } from "./engine/holder";
+import { emptyHolder, type HolderState } from "./engine/schema";
+import { packCard } from "./engine/protocol";
+import { acceptCard, decks, importFile, removeCard, untrustIssuer, viewCards, type CardView, type ImportOutcome } from "./engine/holder";
 import { revokePlug } from "./engine/plug";
-import { NoStorage, askToKeepStorage, loadState, saveState } from "./store";
+import { NoStorage, askToKeepStorage, loadStored, saveEnvelope } from "./store";
 import { withExampleCards } from "./examples";
 import { LINK_MARK, cardLink, unwrapInput } from "./links";
 import { CardFace, Icon, formatDate, issuerColour, npub, shortNpub } from "./ui";
+import { deriveKey, lockVault, makeBackup, makeKey, readBackup, recoverKeysFor, unlockVault, type Envelope, type Unlocked, type Vault } from "./vault";
+import { LockedScreen, SetupScreen } from "./setup";
 
 type Screen = { name: "album" } | { name: "card"; id: string } | { name: "add" } | { name: "check" } | { name: "apps" };
+type Phase = { kind: "loading" } | { kind: "error" } | { kind: "setup"; carry: HolderState } | { kind: "locked"; envelope: Envelope } | { kind: "open" };
 const nowIso = () => new Date().toISOString();
-const BACKUP_FORMAT = "album-backup";
+/** Album locks itself when it has been out of sight this long. */
+const LOCK_AFTER_MS = 5 * 60 * 1000;
 
 export default function App() {
-  const [state, setState] = useState<HolderState | null>(null);
-  const [loadError, setLoadError] = useState(false);
+  const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  const [unlocked, setUnlocked] = useState<Unlocked | null>(null);
   const [noStorage, setNoStorage] = useState(false);
   const [screen, setScreen] = useState<Screen>({ name: "album" });
   const [notice, setNotice] = useState<string | null>(null);
   const pendingLink = useRef<string | null>(null);
+  const latest = useRef<Unlocked | null>(null);
+  const envelope = useRef<Envelope | null>(null);
 
   useEffect(() => {
     if (location.hash.startsWith(LINK_MARK)) {
       pendingLink.current = location.href;
       history.replaceState(null, "", location.pathname + location.search);
     }
-    loadState()
-      .then(setState)
+    loadStored()
+      .then((stored) => {
+        if (stored.kind === "vault") {
+          envelope.current = stored.envelope;
+          setPhase({ kind: "locked", envelope: stored.envelope });
+        } else setPhase({ kind: "setup", carry: stored.kind === "legacy" ? stored.holder : emptyHolder });
+      })
       .catch((error) => {
         if (error instanceof NoStorage) {
           setNoStorage(true);
-          setState(emptyHolder);
-        } else setLoadError(true);
+          setPhase({ kind: "setup", carry: emptyHolder });
+        } else setPhase({ kind: "error" });
       });
     askToKeepStorage();
     const onPop = (event: PopStateEvent) => setScreen((event.state as Screen | null) ?? { name: "album" });
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
+
+  const lock = useCallback(() => {
+    if (!envelope.current) return;
+    latest.current = null;
+    setUnlocked(null);
+    setScreen({ name: "album" });
+    setPhase({ kind: "locked", envelope: envelope.current });
+  }, []);
+
+  useEffect(() => {
+    let hiddenAt = 0;
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") hiddenAt = Date.now();
+      else if (hiddenAt && Date.now() - hiddenAt > LOCK_AFTER_MS && !noStorage) lock();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [lock, noStorage]);
 
   useEffect(() => {
     if (!notice) return;
@@ -60,18 +89,42 @@ export default function App() {
     else go({ name: "album" }, true);
   }, [go]);
 
-  const update = useCallback((next: HolderState) => {
-    setState(next);
-    if (noStorage) return;
-    saveState(next).catch(() => setNotice("Album couldn't save that change on this phone. Try again before closing Album."));
+  const open = useCallback((next: Unlocked, sealed: Envelope | null) => {
+    latest.current = next;
+    setUnlocked(next);
+    setPhase({ kind: "open" });
+    if (sealed) {
+      envelope.current = sealed;
+      if (!noStorage) saveEnvelope(sealed).catch(() => setNotice("Album couldn't save on this phone. Try again before closing Album."));
+    }
   }, [noStorage]);
+
+  const setVault = useCallback((vault: Vault) => {
+    const current = latest.current;
+    if (!current) return;
+    const next = { ...current, vault };
+    latest.current = next;
+    setUnlocked(next);
+    lockVault(next)
+      .then((sealed) => {
+        envelope.current = sealed;
+        return noStorage ? undefined : saveEnvelope(sealed);
+      })
+      .catch(() => setNotice("Album couldn't save that change on this phone. Try again before closing Album."));
+  }, [noStorage]);
+  const update = useCallback((holder: HolderState) => {
+    if (latest.current) setVault({ ...latest.current.vault, holder });
+  }, [setVault]);
 
   const receive = useCallback(
     (raw: string): string | null => {
-      if (!state) return null;
-      const outcome: ImportOutcome = importFile(state, unwrapInput(raw), nowIso());
+      const current = latest.current;
+      if (!current) return null;
+      const text = unwrapInput(raw);
+      const vault = recoverKeysFor(current.vault, text, nowIso());
+      const outcome: ImportOutcome = importFile(vault.holder, text, nowIso());
       if (outcome.kind === "rejected") return outcome.reason;
-      update(outcome.state);
+      setVault({ ...vault, holder: outcome.state });
       if (outcome.kind === "added") {
         setNotice("Added to your Album.");
         go({ name: "card", id: outcome.id });
@@ -83,30 +136,54 @@ export default function App() {
         setNotice(outcome.added + " added, " + outcome.quarantined + " waiting to be checked, " + outcome.duplicate + " you already had, " + outcome.rejected + " refused.");
       return null;
     },
-    [state, update, go],
+    [setVault, go],
   );
 
   useEffect(() => {
-    if (state && pendingLink.current) {
+    if (phase.kind === "open" && pendingLink.current) {
       const link = pendingLink.current;
       pendingLink.current = null;
       const problem = receive(link);
       if (problem) setNotice(problem);
     }
-  }, [state, receive]);
+  }, [phase.kind, receive]);
 
+  const state = unlocked?.vault.holder ?? null;
   const views = useMemo(() => (state ? viewCards(state, Date.now()) : []), [state]);
 
-  if (loadError)
+  const makeCardKey = useCallback((label: string): boolean => {
+    const current = latest.current;
+    if (!current) return false;
+    const vault = makeKey(current.vault, label, nowIso());
+    if (!vault) return false;
+    setVault(vault);
+    return true;
+  }, [setVault]);
+  const tryExamples = useCallback(() => {
+    const current = latest.current;
+    if (!current) return;
+    const vault = makeKey(current.vault, "Example issuer", nowIso()) ?? current.vault;
+    const holderKey = deriveKey(vault.words, vault.nextIndex - 1);
+    setVault({ ...vault, holder: withExampleCards(vault.holder, nowIso(), holderKey) });
+  }, [setVault]);
+
+  const banner = noStorage && (
+    <div className="know" role="note" style={{ margin: "12px 20px 0", width: "auto", cursor: "default" }}>
+      {Icon.info()}
+      <span className="small">This browser gives Album nowhere to keep cards, so everything here goes when you close it.</span>
+    </div>
+  );
+
+  if (phase.kind === "error")
     return (
       <main className="app">
         <div className="screen">
           <h1 className="h1 sm">Album couldn't read what it has stored</h1>
-          <p className="small">Nothing has been changed or deleted. If you have a backup file, you can load it in a fresh copy of Album.</p>
+          <p className="small">Nothing has been changed or deleted. Your recovery words and a backup file can bring your cards back in a fresh copy of Album.</p>
         </div>
       </main>
     );
-  if (!state)
+  if (phase.kind === "loading")
     return (
       <main className="app">
         <div className="screen">
@@ -114,27 +191,59 @@ export default function App() {
         </div>
       </main>
     );
+  if (phase.kind === "setup")
+    return (
+      <main className="app">
+        {banner}
+        <SetupScreen carry={phase.carry} onDone={open} />
+      </main>
+    );
+  if (phase.kind === "locked" || !unlocked || !state)
+    return (
+      <main className="app">
+        <LockedScreen
+          envelope={phase.kind === "locked" ? phase.envelope : envelope.current!}
+          onOpen={(next) => open(next, null)}
+          onStartAgain={() => setPhase({ kind: "setup", carry: emptyHolder })}
+        />
+      </main>
+    );
 
   const tab = screen.name === "add" ? "add" : screen.name === "apps" ? "apps" : "album";
   const showTabs = screen.name === "album" || screen.name === "add" || screen.name === "apps";
+  const vault = unlocked.vault;
   return (
     <main className="app">
-      {noStorage && (
-        <div className="know" role="note" style={{ margin: "12px 20px 0", width: "auto", cursor: "default" }}>
-          {Icon.info()}
-          <span className="small">This browser gives Album nowhere to keep cards, so everything here goes when you close it.</span>
-        </div>
-      )}
+      {banner}
       {notice && (
         <div className="notice" role="status" style={{ margin: "12px 20px 0" }}>
           {notice}
         </div>
       )}
-      {screen.name === "album" && <AlbumScreen state={state} views={views} go={go} update={update} />}
+      {screen.name === "album" && <AlbumScreen state={state} views={views} go={go} update={update} tryExamples={tryExamples} />}
       {screen.name === "card" && <CardScreen views={views} id={screen.id} back={back} state={state} update={update} setNotice={setNotice} />}
-      {screen.name === "add" && <AddScreen state={state} receive={receive} update={update} setNotice={setNotice} />}
+      {screen.name === "add" && <AddScreen state={state} receive={receive} makeCardKey={makeCardKey} setNotice={setNotice} />}
       {screen.name === "check" && <CheckScreen state={state} views={views} back={back} update={update} go={go} setNotice={setNotice} />}
-      {screen.name === "apps" && <AppsScreen state={state} views={views} update={update} setNotice={setNotice} />}
+      {screen.name === "apps" && (
+        <AppsScreen
+          state={state}
+          views={views}
+          update={update}
+          setNotice={setNotice}
+          vault={vault}
+          setVault={setVault}
+          lock={noStorage ? null : lock}
+          checkPasscode={async (passcode) => {
+            if (!envelope.current) return false;
+            try {
+              await unlockVault(envelope.current, passcode);
+              return true;
+            } catch {
+              return false;
+            }
+          }}
+        />
+      )}
       {showTabs && (
         <nav className="tabs" aria-label="Main">
           <button type="button" aria-current={tab === "album" ? "page" : undefined} onClick={() => go({ name: "album" }, true)}>
@@ -157,7 +266,7 @@ type Update = (state: HolderState) => void;
 
 const isExample = (view: CardView) => view.held.definition.content.includes('"issuerName":"Example ');
 
-function AlbumScreen({ state, views, go, update }: { state: HolderState; views: CardView[]; go: Go; update: Update }) {
+function AlbumScreen({ state, views, go, update, tryExamples }: { state: HolderState; views: CardView[]; go: Go; update: Update; tryExamples: () => void }) {
   const held = views.filter((view) => view.held.status === "held");
   const waiting = views.filter((view) => view.held.status === "quarantined");
   const allDecks = decks(views);
@@ -204,7 +313,7 @@ function AlbumScreen({ state, views, go, update }: { state: HolderState; views: 
           <button type="button" className="btn" onClick={() => go({ name: "add" }, true)}>
             Add a card
           </button>
-          <button type="button" className="btn second" onClick={() => update(withExampleCards(state, nowIso()))}>
+          <button type="button" className="btn second" onClick={tryExamples}>
             Try it with example cards
           </button>
         </div>
@@ -307,6 +416,9 @@ function CardScreen({ views, id, back, state, update, setNotice }: { views: Card
             {checks.status === "unknown" && card && <p className="tiny soft">Not yet checked against the issuer's list of withdrawn cards.</p>}
             {checks.status === "revoked" && <div className="badbox">{Icon.cross()}<span><strong>Withdrawn.</strong> The issuer has withdrawn this card.</span></div>}
             {checks.status === "expired" && <div className="badbox">{Icon.cross()}<span><strong>Expired.</strong> This card's date has passed.</span></div>}
+            {checks.holderKey === "yours" && card && (
+              <div className="okbox">{Icon.tick()}<span><strong>Yours.</strong> Given to one of your card keys, so you can prove it.</span></div>
+            )}
             {checks.holderKey === "not-yours" && card && (
               <div className="know" style={{ cursor: "default" }}>
                 {Icon.info()}
@@ -400,7 +512,7 @@ function Scanner({ onRead, onClose }: { onRead: (text: string) => void; onClose:
   );
 }
 
-function AddScreen({ state, receive, update, setNotice }: { state: HolderState; receive: (raw: string) => string | null; update: Update; setNotice: (text: string) => void }) {
+function AddScreen({ state, receive, makeCardKey, setNotice }: { state: HolderState; receive: (raw: string) => string | null; makeCardKey: (label: string) => boolean; setNotice: (text: string) => void }) {
   const [text, setText] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -425,9 +537,7 @@ function AddScreen({ state, receive, update, setNotice }: { state: HolderState; 
   const makeKey = () => {
     const label = keyLabel.trim();
     if (!label) return;
-    const next = addKey(state, label, generateKey(), nowIso());
-    if (next === state) return setNotice("Album couldn't make that key. Use a shorter name, up to 60 letters.");
-    update(next);
+    if (!makeCardKey(label)) return setNotice("Album couldn't make that key. Use a shorter name, up to 60 letters.");
     setKeyLabel("");
   };
   const copy = async (pubkey: string) => {
@@ -479,7 +589,7 @@ function AddScreen({ state, receive, update, setNotice }: { state: HolderState; 
       <section className="panel" aria-labelledby="keys">
         <h2 id="keys" className="h3">Your card keys</h2>
         <p className="small" style={{ color: "#3E424A" }}>
-          An issuer sends a card to a key. Make one key for each issuer, so issuers can't link your cards together. Give it to the issuer privately. For The Kop Fund, you sign a message with your lock naming this key. Never post it beside your lock.
+          An issuer sends a card to a key. Each key comes from your recovery words, so the words bring it back. Make one key for each issuer, so issuers can't link your cards together. Give it to the issuer privately. For The Kop Fund, you sign a message with your lock naming this key. Never post it beside your lock.
         </p>
         {state.keys.map((key) => (
           <div key={key.publicKey} className="col" style={{ gap: 6 }}>
@@ -599,11 +709,17 @@ function WaitingCard({ view, state, update, go, setNotice }: { view: CardView; s
   );
 }
 
-function AppsScreen({ state, views, update, setNotice }: { state: HolderState; views: CardView[]; update: Update; setNotice: (text: string) => void }) {
+function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, checkPasscode }: {
+  state: HolderState; views: CardView[]; update: Update; setNotice: (text: string) => void;
+  vault: Vault; setVault: (vault: Vault) => void; lock: (() => void) | null; checkPasscode: (passcode: string) => Promise<boolean>;
+}) {
   const fileInput = useRef<HTMLInputElement>(null);
-  const [pendingBackup, setPendingBackup] = useState<HolderState | null>(null);
-  const save = () => {
-    const blob = new Blob([JSON.stringify({ format: BACKUP_FORMAT, version: 1, state }, null, 1)], { type: "application/json" });
+  const [pendingBackup, setPendingBackup] = useState<{ holder: HolderState; nextIndex: number } | null>(null);
+  const [showWords, setShowWords] = useState<"no" | "ask" | "yes">("no");
+  const [passcode, setPasscode] = useState("");
+  const [wrong, setWrong] = useState(false);
+  const save = async () => {
+    const blob = new Blob([await makeBackup(vault)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -614,18 +730,30 @@ function AppsScreen({ state, views, update, setNotice }: { state: HolderState; v
   const onFile = async (file: File | undefined) => {
     if (fileInput.current) fileInput.current.value = "";
     if (!file) return;
-    try {
-      const parsed = JSON.parse(await file.text());
-      if (parsed?.format !== BACKUP_FORMAT || parsed?.version !== 1) throw new Error();
-      setPendingBackup(parseHolder(parsed.state));
-    } catch {
-      setNotice("That isn't an Album backup file, or it's damaged.");
+    if (file.size > 20_000_000) return setNotice("That file is too large to be an Album backup.");
+    const read = await readBackup(await file.text(), vault.words);
+    if (!read.ok) return setNotice(read.reason);
+    setPendingBackup({ holder: read.holder, nextIndex: read.nextIndex });
+  };
+  const reveal = async () => {
+    const ok = await checkPasscode(passcode);
+    setWrong(!ok);
+    if (ok) {
+      setShowWords("yes");
+      setPasscode("");
     }
   };
   const countFrom = (pubkey: string) => views.filter((view) => view.held.status === "held" && view.held.award.pubkey === pubkey).length;
   return (
     <div className="screen" style={{ gap: 22 }}>
-      <h1 className="h1 sm" style={{ fontSize: 34 }}>Apps</h1>
+      <div className="between" style={{ alignItems: "center" }}>
+        <h1 className="h1 sm" style={{ fontSize: 34 }}>Apps</h1>
+        {lock && (
+          <button type="button" className="btn small second" style={{ width: "auto" }} onClick={lock}>
+            Lock Album
+          </button>
+        )}
+      </div>
 
       <section className="col" style={{ gap: 4 }}>
         <h2 className="tiny soft" style={{ margin: "0 0 6px", fontWeight: 600 }}>Apps you've shown cards to</h2>
@@ -664,8 +792,40 @@ function AppsScreen({ state, views, update, setNotice }: { state: HolderState; v
       </section>
 
       <section className="panel">
+        <h2 className="h3">Your recovery words</h2>
+        <p className="small" style={{ color: "#3E424A" }}>Every card key comes from your 12 words. With them, a new phone gets every key back. Without them, a lost phone means cards you can never prove again.</p>
+        {showWords === "no" && (
+          <button type="button" className="btn second" onClick={() => setShowWords("ask")}>
+            Show my recovery words
+          </button>
+        )}
+        {showWords === "ask" && (
+          <div className="field">
+            <label htmlFor="showpass">Your passcode</label>
+            <input id="showpass" className="input" type="password" autoComplete="current-password" value={passcode} onChange={(event) => setPasscode(event.target.value)} />
+            {wrong && <p className="small" style={{ color: "#A3111D" }}>That passcode doesn't open this Album.</p>}
+            <button type="button" className="btn" disabled={!passcode} onClick={reveal}>
+              Show them
+            </button>
+          </div>
+        )}
+        {showWords === "yes" && (
+          <>
+            <ol className="words">
+              {vault.words.split(" ").map((word, index) => (
+                <li key={index}>{word}</li>
+              ))}
+            </ol>
+            <button type="button" className="btn second" onClick={() => setShowWords("no")}>
+              Hide them
+            </button>
+          </>
+        )}
+      </section>
+
+      <section className="panel">
         <h2 className="h3">Take your cards with you</h2>
-        <p className="small" style={{ color: "#3E424A" }}>Save every card and your card keys in one file. Lose the phone without it and your cards are gone. Keep the file private: anyone with it holds your card keys.</p>
+        <p className="small" style={{ color: "#3E424A" }}>Save every card in one file. It's locked with your recovery words, so only they open it. Keep it somewhere other than this phone.</p>
         <button type="button" className="btn" onClick={save}>
           Save a backup file
         </button>
@@ -676,9 +836,18 @@ function AppsScreen({ state, views, update, setNotice }: { state: HolderState; v
         {pendingBackup && (
           <div className="badbox" style={{ flexDirection: "column" }}>
             <strong>Replace everything in this Album?</strong>
-            <span>The backup has {pendingBackup.cards.length} cards and {pendingBackup.keys.length} card keys. What's here now will be gone.</span>
+            <span>The backup has {pendingBackup.holder.cards.length} cards and {pendingBackup.holder.keys.length} card keys. What's here now will be gone.</span>
             <div className="row">
-              <button type="button" className="btn small" style={{ background: "#A3111D", width: "auto" }} onClick={() => { update(pendingBackup); setPendingBackup(null); setNotice("Backup loaded."); }}>
+              <button
+                type="button"
+                className="btn small"
+                style={{ background: "#A3111D", width: "auto" }}
+                onClick={() => {
+                  setVault({ ...vault, holder: pendingBackup.holder, nextIndex: Math.max(vault.nextIndex, pendingBackup.nextIndex) });
+                  setPendingBackup(null);
+                  setNotice("Backup loaded.");
+                }}
+              >
                 Replace
               </button>
               <button type="button" className="btn small second" style={{ width: "auto" }} onClick={() => setPendingBackup(null)}>
@@ -689,10 +858,8 @@ function AppsScreen({ state, views, update, setNotice }: { state: HolderState; v
         )}
       </section>
 
-      <p className="tiny soft">Album keeps everything on this phone and talks to no server. It isn't encrypted yet, so anyone who can open Album on this phone can see your cards. Early build, not yet reviewed.</p>
-      {state.cards.length === 0 && state.keys.length === 0 ? null : (
-        <ResetAlbum update={update} />
-      )}
+      <p className="tiny soft">Album keeps everything on this phone, locked with your passcode, and talks to no server. It locks itself after five minutes out of sight. Early build, not yet reviewed.</p>
+      {state.cards.length === 0 && state.keys.length === 0 ? null : <ResetAlbum update={update} />}
     </div>
   );
 }
@@ -708,7 +875,7 @@ function ResetAlbum({ update }: { update: Update }) {
   return (
     <div className="badbox" style={{ flexDirection: "column" }}>
       <strong>Empty this Album?</strong>
-      <span>Every card and card key on this phone is deleted. Only a backup file can bring them back.</span>
+      <span>Every card on this phone is deleted. Your recovery words still bring the keys back, and a backup file brings the cards back.</span>
       <div className="row">
         <button type="button" className="btn small" style={{ background: "#A3111D", width: "auto" }} onClick={() => { update(emptyHolder); setConfirm(false); }}>
           Empty it
