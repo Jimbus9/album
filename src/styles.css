@@ -64,3 +64,4 @@ video.scan{width:100%;border-radius:12px;background:#000;aspect-ratio:1/1;object
 .words{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;counter-reset:w}
 .words li{counter-increment:w;display:flex;gap:10px;align-items:baseline;padding:10px 12px;background:var(--paper);border-radius:8px;font-family:var(--mono);font-size:15px}
 .words li::before{content:counter(w);color:var(--soft);font-size:12px;min-width:18px}
+.chip{min-height:44px;padding:0 14px;border-radius:22px;border:1.5px solid var(--ink);background:var(--white);font-family:var(--mono);font-size:15px;cursor:pointer}

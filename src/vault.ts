@@ -15,7 +15,6 @@ import { addKey } from "./engine/holder";
  */
 export type Vault = { v: 1; words: string; nextIndex: number; holder: HolderState };
 export type Envelope = { v: 1; kdf: "pbkdf2-sha256"; iterations: number; salt: string; iv: string; data: string };
-export type Unlocked = { vault: Vault; key: CryptoKey; salt: Uint8Array };
 
 export const WORDS = wordlist;
 export const ITERATIONS = 600_000;
@@ -86,29 +85,101 @@ function parseVault(x: unknown): Vault {
   return { v: 1, words: v.words, nextIndex: v.nextIndex as number, holder: parseHolder(v.holder) };
 }
 
-/** Makes a new vault from words and a passcode. `holder` carries over cards from before the words existed. */
-export async function createVault(words: string, passcode: string, holder: HolderState = emptyHolder): Promise<{ unlocked: Unlocked; envelope: Envelope }> {
+/**
+ * The stored vault, version 2. The cards, keys and words are encrypted with a random data key. That data key is
+ * itself encrypted ("wrapped") twice over: once with a key from the passcode, and, if switched on, once with a key
+ * from a passkey (fingerprint or face). Either one opens Album. Version 1 (passcode only) is read and upgraded.
+ */
+export type Wrap = { iv: string; key: string };
+export type PasscodeWrap = Wrap & { salt: string; iterations: number };
+export type PasskeyWrap = Wrap & { id: string; salt: string };
+export type EnvelopeV2 = { v: 2; iv: string; data: string; passcode: PasscodeWrap; passkey?: PasskeyWrap };
+export type Stored = Envelope | EnvelopeV2;
+export type Unlocked = { vault: Vault; dataKey: Uint8Array<ArrayBuffer>; passcode: PasscodeWrap; passkey?: PasskeyWrap };
+
+async function aesKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+async function wrap(kek: CryptoKey, dataKey: Uint8Array<ArrayBuffer>): Promise<Wrap> {
+  const iv = random(12);
+  return { iv: b64(iv), key: b64(new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, dataKey))) };
+}
+async function unwrap(kek: CryptoKey, w: Wrap): Promise<Uint8Array<ArrayBuffer>> {
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(w.iv) }, kek, unb64(w.key)));
+}
+async function passcodeWrap(passcode: string, dataKey: Uint8Array<ArrayBuffer>): Promise<PasscodeWrap> {
   const salt = random(16);
-  const key = await passcodeKey(passcode, salt);
+  return { ...(await wrap(await passcodeKey(passcode, salt), dataKey)), salt: b64(salt), iterations: ITERATIONS };
+}
+/** The key a passkey's PRF output gives, through HKDF so the raw output is never used as a key directly. */
+async function passkeyKey(prfOutput: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  const base = await crypto.subtle.importKey("raw", prfOutput, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: encoder.encode("album-passkey-v1") }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+/** Makes a new vault from words and a passcode. `holder` carries over cards from before the words existed. */
+export async function createVault(words: string, passcode: string, holder: HolderState = emptyHolder): Promise<{ unlocked: Unlocked; envelope: EnvelopeV2 }> {
+  const dataKey = random(32);
   const vault: Vault = { v: 1, words: cleanWords(words), nextIndex: 0, holder };
-  const unlocked = { vault, key, salt };
+  const unlocked: Unlocked = { vault, dataKey, passcode: await passcodeWrap(passcode, dataKey) };
   return { unlocked, envelope: await lockVault(unlocked) };
 }
-export async function lockVault(unlocked: Unlocked): Promise<Envelope> {
-  const { iv, data } = await seal(unlocked.key, unlocked.vault);
-  return { v: 1, kdf: "pbkdf2-sha256", iterations: ITERATIONS, salt: b64(unlocked.salt), iv, data };
+export async function lockVault(unlocked: Unlocked): Promise<EnvelopeV2> {
+  const { iv, data } = await seal(await aesKey(unlocked.dataKey), unlocked.vault);
+  return { v: 2, iv, data, passcode: unlocked.passcode, ...(unlocked.passkey ? { passkey: unlocked.passkey } : {}) };
 }
-/** Opens the vault. A wrong passcode throws. */
-export async function unlockVault(envelope: Envelope, passcode: string): Promise<Unlocked> {
-  const salt = unb64(envelope.salt);
-  const key = await passcodeKey(passcode, salt, envelope.iterations);
-  const vault = parseVault(await open(key, envelope.iv, envelope.data));
-  return { vault, key, salt };
+async function openData(envelope: EnvelopeV2, dataKey: Uint8Array<ArrayBuffer>): Promise<Unlocked> {
+  const vault = parseVault(await open(await aesKey(dataKey), envelope.iv, envelope.data));
+  return { vault, dataKey, passcode: envelope.passcode, ...(envelope.passkey ? { passkey: envelope.passkey } : {}) };
 }
+/** Opens the vault with the passcode. A wrong passcode throws. A version 1 vault comes back ready to save as version 2. */
+export async function unlockVault(envelope: Stored, passcode: string): Promise<Unlocked> {
+  if (envelope.v === 1) {
+    const key = await passcodeKey(passcode, unb64(envelope.salt), envelope.iterations);
+    const vault = parseVault(await open(key, envelope.iv, envelope.data));
+    const dataKey = random(32);
+    return { vault, dataKey, passcode: await passcodeWrap(passcode, dataKey) };
+  }
+  const w = envelope.passcode;
+  return openData(envelope, await unwrap(await passcodeKey(passcode, unb64(w.salt), w.iterations), w));
+}
+/** Opens the vault with a passkey's PRF output. A different passkey throws. */
+export async function unlockWithPasskey(envelope: EnvelopeV2, prfOutput: Uint8Array<ArrayBuffer>): Promise<Unlocked> {
+  if (!envelope.passkey) throw new Error("No passkey set up.");
+  return openData(envelope, await unwrap(await passkeyKey(prfOutput), envelope.passkey));
+}
+/** Checks a passcode without changing anything. */
+export async function passcodeOpens(unlocked: Unlocked, passcode: string): Promise<boolean> {
+  try {
+    const w = unlocked.passcode;
+    await unwrap(await passcodeKey(passcode, unb64(w.salt), w.iterations), w);
+    return true;
+  } catch {
+    return false;
+  }
+}
+export async function addPasskey(unlocked: Unlocked, id: string, salt: Uint8Array<ArrayBuffer>, prfOutput: Uint8Array<ArrayBuffer>): Promise<Unlocked> {
+  return { ...unlocked, passkey: { ...(await wrap(await passkeyKey(prfOutput), unlocked.dataKey)), id, salt: b64(salt) } };
+}
+export function removePasskey(unlocked: Unlocked): Unlocked {
+  const { passkey: _gone, ...rest } = unlocked;
+  void _gone;
+  return rest;
+}
+export async function changePasscode(unlocked: Unlocked, passcode: string): Promise<Unlocked> {
+  return { ...unlocked, passcode: await passcodeWrap(passcode, unlocked.dataKey) };
+}
+/** Version 1: the whole vault encrypted with the passcode key. Only read, to upgrade it. */
 export function isEnvelope(x: unknown): x is Envelope {
   const e = x as Partial<Envelope> | null;
   return !!e && e.v === 1 && e.kdf === "pbkdf2-sha256" && typeof e.salt === "string" && typeof e.iv === "string" && typeof e.data === "string" && Number.isSafeInteger(e.iterations);
 }
+export function isStored(x: unknown): x is Stored {
+  const e = x as Partial<EnvelopeV2> | null;
+  if (isEnvelope(x)) return true;
+  return !!e && e.v === 2 && typeof e.iv === "string" && typeof e.data === "string" && !!e.passcode && typeof e.passcode.salt === "string";
+}
+export { b64, unb64 };
 
 /** Makes the next card key from the words and stores it under the issuer's name. */
 export function makeKey(vault: Vault, label: string, nowIso: string): Vault | null {

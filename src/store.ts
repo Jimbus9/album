@@ -1,5 +1,5 @@
 import { parseHolder, type HolderState } from "./engine/schema";
-import { isEnvelope, type Envelope } from "./vault";
+import { isStored, type Stored as Sealed } from "./vault";
 
 /**
  * Album keeps one record on this device, in IndexedDB: the encrypted vault (see vault.ts).
@@ -12,7 +12,7 @@ const KEY = "state";
 
 /** Thrown when this browser gives Album no storage at all (some embedded previews). Album then runs for this visit only. */
 export class NoStorage extends Error {}
-export type Stored = { kind: "none" } | { kind: "legacy"; holder: HolderState } | { kind: "vault"; envelope: Envelope };
+export type Stored = { kind: "none" } | { kind: "legacy"; holder: HolderState } | { kind: "vault"; envelope: Sealed };
 
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -38,12 +38,12 @@ export async function loadStored(): Promise<Stored> {
   });
   db.close();
   if (raw === undefined) return { kind: "none" };
-  if (isEnvelope(raw)) return { kind: "vault", envelope: raw };
+  if (isStored(raw)) return { kind: "vault", envelope: raw };
   // A record that is neither is refused rather than replaced, so nothing is lost by accident.
   return { kind: "legacy", holder: parseHolder(raw) };
 }
 
-export async function saveEnvelope(envelope: Envelope): Promise<void> {
+export async function saveEnvelope(envelope: Sealed): Promise<void> {
   const db = await open();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");

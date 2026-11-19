@@ -7,11 +7,12 @@ import { NoStorage, askToKeepStorage, loadStored, saveEnvelope } from "./store";
 import { withExampleCards } from "./examples";
 import { LINK_MARK, cardLink, unwrapInput } from "./links";
 import { CardFace, Icon, formatDate, issuerColour, npub, shortNpub } from "./ui";
-import { deriveKey, lockVault, makeBackup, makeKey, readBackup, recoverKeysFor, unlockVault, type Envelope, type Unlocked, type Vault } from "./vault";
-import { LockedScreen, SetupScreen } from "./setup";
+import { addPasskey, deriveKey, lockVault, makeBackup, makeKey, passcodeOpens, readBackup, recoverKeysFor, removePasskey, unlockWithPasskey, type Stored, type Unlocked, type Vault } from "./vault";
+import { LockedScreen, NoScreenshotsNote, SetupScreen } from "./setup";
+import { makePasskey, passkeysPossible, usePasskey } from "./passkey";
 
 type Screen = { name: "album" } | { name: "card"; id: string } | { name: "add" } | { name: "check" } | { name: "apps" };
-type Phase = { kind: "loading" } | { kind: "error" } | { kind: "setup"; carry: HolderState } | { kind: "locked"; envelope: Envelope } | { kind: "open" };
+type Phase = { kind: "loading" } | { kind: "error" } | { kind: "setup"; carry: HolderState } | { kind: "locked"; envelope: Stored } | { kind: "open" };
 const nowIso = () => new Date().toISOString();
 /** Album locks itself when it has been out of sight this long. */
 const LOCK_AFTER_MS = 5 * 60 * 1000;
@@ -24,7 +25,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const pendingLink = useRef<string | null>(null);
   const latest = useRef<Unlocked | null>(null);
-  const envelope = useRef<Envelope | null>(null);
+  const envelope = useRef<Stored | null>(null);
 
   useEffect(() => {
     if (location.hash.startsWith(LINK_MARK)) {
@@ -89,7 +90,7 @@ export default function App() {
     else go({ name: "album" }, true);
   }, [go]);
 
-  const open = useCallback((next: Unlocked, sealed: Envelope | null) => {
+  const open = useCallback((next: Unlocked, sealed: Stored | null) => {
     latest.current = next;
     setUnlocked(next);
     setPhase({ kind: "open" });
@@ -99,19 +100,23 @@ export default function App() {
     }
   }, [noStorage]);
 
-  const setVault = useCallback((vault: Vault) => {
-    const current = latest.current;
-    if (!current) return;
-    const next = { ...current, vault };
+  const saves = useRef(0);
+  const commit = useCallback((next: Unlocked) => {
     latest.current = next;
     setUnlocked(next);
+    const mine = ++saves.current;
     lockVault(next)
       .then((sealed) => {
+        // Encrypting takes a moment; if a newer change has started meanwhile, only the newer one is saved.
+        if (mine !== saves.current) return;
         envelope.current = sealed;
         return noStorage ? undefined : saveEnvelope(sealed);
       })
       .catch(() => setNotice("Album couldn't save that change on this phone. Try again before closing Album."));
   }, [noStorage]);
+  const setVault = useCallback((vault: Vault) => {
+    if (latest.current) commit({ ...latest.current, vault });
+  }, [commit]);
   const update = useCallback((holder: HolderState) => {
     if (latest.current) setVault({ ...latest.current.vault, holder });
   }, [setVault]);
@@ -203,7 +208,7 @@ export default function App() {
       <main className="app">
         <LockedScreen
           envelope={phase.kind === "locked" ? phase.envelope : envelope.current!}
-          onOpen={(next) => open(next, null)}
+          onOpen={async (next) => open(next, envelope.current?.v === 1 ? await lockVault(next) : null)}
           onStartAgain={() => setPhase({ kind: "setup", carry: emptyHolder })}
         />
       </main>
@@ -233,10 +238,27 @@ export default function App() {
           vault={vault}
           setVault={setVault}
           lock={noStorage ? null : lock}
-          checkPasscode={async (passcode) => {
-            if (!envelope.current) return false;
+          checkPasscode={(passcode) => passcodeOpens(unlocked, passcode)}
+          passkeyOn={!!unlocked.passkey}
+          passkeyPossible={passkeysPossible() && !noStorage}
+          turnOnPasskey={async () => {
+            const made = await makePasskey();
+            if (!made.ok) return made.reason;
+            if (latest.current) commit(await addPasskey(latest.current, made.id, made.salt, made.output));
+            setNotice("Your fingerprint or face now opens Album.");
+            return null;
+          }}
+          turnOffPasskey={() => {
+            if (latest.current) commit(removePasskey(latest.current));
+            setNotice("Album now opens with your passcode only.");
+          }}
+          checkPasskey={async () => {
+            const current = latest.current;
+            if (!current?.passkey || !envelope.current || envelope.current.v !== 2) return false;
+            const output = await usePasskey(current.passkey.id, current.passkey.salt);
+            if (!output) return false;
             try {
-              await unlockVault(envelope.current, passcode);
+              await unlockWithPasskey(envelope.current, output);
               return true;
             } catch {
               return false;
@@ -709,10 +731,13 @@ function WaitingCard({ view, state, update, go, setNotice }: { view: CardView; s
   );
 }
 
-function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, checkPasscode }: {
+function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, checkPasscode, passkeyOn, passkeyPossible, turnOnPasskey, turnOffPasskey, checkPasskey }: {
   state: HolderState; views: CardView[]; update: Update; setNotice: (text: string) => void;
   vault: Vault; setVault: (vault: Vault) => void; lock: (() => void) | null; checkPasscode: (passcode: string) => Promise<boolean>;
+  passkeyOn: boolean; passkeyPossible: boolean; turnOnPasskey: () => Promise<string | null>; turnOffPasskey: () => void; checkPasskey: () => Promise<boolean>;
 }) {
+  const [passkeyProblem, setPasskeyProblem] = useState<string | null>(null);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [pendingBackup, setPendingBackup] = useState<{ holder: HolderState; nextIndex: number } | null>(null);
   const [showWords, setShowWords] = useState<"no" | "ask" | "yes">("no");
@@ -791,6 +816,36 @@ function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, ch
         ))}
       </section>
 
+      {(passkeyOn || passkeyPossible) && (
+        <section className="panel">
+          <h2 className="h3">Fingerprint or face</h2>
+          <p className="small" style={{ color: "#3E424A" }}>
+            {passkeyOn
+              ? "On. Your fingerprint or face opens Album, through a passkey. Your passcode still works."
+              : "Open Album with your fingerprint or face instead of typing your passcode. Album makes a passkey for it; on Android, Google Password Manager keeps passkeys and can sync them to your other signed-in devices."}
+          </p>
+          {passkeyProblem && <p className="small" style={{ color: "#A3111D" }} role="alert">{passkeyProblem}</p>}
+          {passkeyOn ? (
+            <button type="button" className="btn second" onClick={turnOffPasskey}>
+              Turn it off
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn"
+              disabled={passkeyBusy}
+              onClick={async () => {
+                setPasskeyBusy(true);
+                setPasskeyProblem(await turnOnPasskey());
+                setPasskeyBusy(false);
+              }}
+            >
+              {passkeyBusy ? "Waiting for your phone…" : "Turn it on"}
+            </button>
+          )}
+        </section>
+      )}
+
       <section className="panel">
         <h2 className="h3">Your recovery words</h2>
         <p className="small" style={{ color: "#3E424A" }}>Every card key comes from your 12 words. With them, a new phone gets every key back. Without them, a lost phone means cards you can never prove again.</p>
@@ -799,11 +854,23 @@ function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, ch
             Show my recovery words
           </button>
         )}
+        {showWords === "ask" && passkeyOn && (
+          <button
+            type="button"
+            className="btn"
+            onClick={async () => {
+              if (await checkPasskey()) setShowWords("yes");
+              else setWrong(true);
+            }}
+          >
+            Use fingerprint or face
+          </button>
+        )}
         {showWords === "ask" && (
           <div className="field">
-            <label htmlFor="showpass">Your passcode</label>
+            <label htmlFor="showpass">{passkeyOn ? "Or your passcode" : "Your passcode"}</label>
             <input id="showpass" className="input" type="password" autoComplete="current-password" value={passcode} onChange={(event) => setPasscode(event.target.value)} />
-            {wrong && <p className="small" style={{ color: "#A3111D" }}>That passcode doesn't open this Album.</p>}
+            {wrong && <p className="small" style={{ color: "#A3111D" }}>That didn't open it. Try again.</p>}
             <button type="button" className="btn" disabled={!passcode} onClick={reveal}>
               Show them
             </button>
@@ -816,6 +883,7 @@ function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, ch
                 <li key={index}>{word}</li>
               ))}
             </ol>
+            <NoScreenshotsNote />
             <button type="button" className="btn second" onClick={() => setShowWords("no")}>
               Hide them
             </button>
@@ -858,7 +926,7 @@ function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, ch
         )}
       </section>
 
-      <p className="tiny soft">Album keeps everything on this phone, locked with your passcode, and talks to no server. It locks itself after five minutes out of sight. Early build, not yet reviewed.</p>
+      <p className="tiny soft">Album keeps everything on this phone, locked, and talks to no server. It locks itself after five minutes out of sight. Early build, not yet reviewed.</p>
       {state.cards.length === 0 && state.keys.length === 0 ? null : <ResetAlbum update={update} />}
     </div>
   );
