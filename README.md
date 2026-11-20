@@ -18,11 +18,12 @@ Cards are issuer-signed Nostr-format events. The card engine in `src/engine/` is
 - Backup file of every card, encrypted with a key from the recovery words: only the words open it.
 - Example cards to try it.
 
+- **The bridge for other apps.** An app sends the person to Album with `#ask=` and the cards it wants; Album shows who is asking and where the answer goes; on yes it sends them back with `#album-answer=`. No server. Allowances are kept per app name and site, and can be stopped under Apps. Rules: [docs/bridge.md](docs/bridge.md). Helper to copy into an app: [client/album-ask.mjs](client/album-ask.mjs).
+
 ## Not yet
 
 - Keys made before the recovery words existed (earlier builds) can't be recovered from the words.
 - Fingerprint unlock is tested with Chrome's virtual authenticator, not yet on a real phone.
-- Apps can't ask for cards yet. The plug (`src/engine/plug.ts`) is built; the way another app reaches Album is not.
 - Empty slots for cards not yet earned need a public catalogue from the issuer. Not built.
 - Showing or hiding who issued a card isn't in the engine yet.
 - Some engine messages still say "Grimoire card", because the engine is unchanged.

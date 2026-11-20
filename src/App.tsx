@@ -10,6 +10,8 @@ import { CardFace, Icon, formatDate, issuerColour, npub, shortNpub } from "./ui"
 import { addPasskey, deriveKey, lockVault, makeBackup, makeKey, passcodeOpens, readBackup, recoverKeysFor, removePasskey, unlockWithPasskey, type Stored, type Unlocked, type Vault } from "./vault";
 import { LockedScreen, NoScreenshotsNote, SetupScreen } from "./setup";
 import { makePasskey, passkeysPossible, usePasskey } from "./passkey";
+import { ASK_MARK, allow, alreadyAllowed, answerAddress, answerFor, declined, parseAsk, type ParsedAsk } from "./bridge";
+import type { PlugCard } from "./engine/plug";
 
 type Screen = { name: "album" } | { name: "card"; id: string } | { name: "add" } | { name: "check" } | { name: "apps" };
 type Phase = { kind: "loading" } | { kind: "error" } | { kind: "setup"; carry: HolderState } | { kind: "locked"; envelope: Stored } | { kind: "open" };
@@ -24,11 +26,15 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>({ name: "album" });
   const [notice, setNotice] = useState<string | null>(null);
   const pendingLink = useRef<string | null>(null);
+  const [ask, setAsk] = useState<ParsedAsk | null>(null);
   const latest = useRef<Unlocked | null>(null);
   const envelope = useRef<Stored | null>(null);
 
   useEffect(() => {
-    if (location.hash.startsWith(LINK_MARK)) {
+    if (location.hash.startsWith(ASK_MARK)) {
+      setAsk(parseAsk(location.hash));
+      history.replaceState(null, "", location.pathname + location.search);
+    } else if (location.hash.startsWith(LINK_MARK)) {
       pendingLink.current = location.href;
       history.replaceState(null, "", location.pathname + location.search);
     }
@@ -101,11 +107,11 @@ export default function App() {
   }, [noStorage]);
 
   const saves = useRef(0);
-  const commit = useCallback((next: Unlocked) => {
+  const commit = useCallback((next: Unlocked): Promise<void> => {
     latest.current = next;
     setUnlocked(next);
     const mine = ++saves.current;
-    lockVault(next)
+    return lockVault(next)
       .then((sealed) => {
         // Encrypting takes a moment; if a newer change has started meanwhile, only the newer one is saved.
         if (mine !== saves.current) return;
@@ -117,6 +123,23 @@ export default function App() {
   const setVault = useCallback((vault: Vault) => {
     if (latest.current) commit({ ...latest.current, vault });
   }, [commit]);
+  /** Records the person's yes, waits until it is saved, then sends them back to the app with the answer. */
+  const allowAsk = useCallback(async () => {
+    const current = latest.current;
+    if (!current || !ask?.ok) return;
+    const holder = allow(current.vault.holder, ask.request, nowIso());
+    await commit({ ...current, vault: { ...current.vault, holder } });
+    location.assign(answerAddress(ask.request, answerFor(holder, ask.request, Date.now())));
+  }, [ask, commit]);
+  const declineAsk = useCallback(() => {
+    if (ask?.ok) location.assign(answerAddress(ask.request, declined(ask.request)));
+  }, [ask]);
+  useEffect(() => {
+    // Already allowed for every card asked about: answer at once, once Album is open.
+    if (phase.kind !== "open" || !ask?.ok || !latest.current) return;
+    const holder = latest.current.vault.holder;
+    if (alreadyAllowed(holder, ask.request)) location.assign(answerAddress(ask.request, answerFor(holder, ask.request, Date.now())));
+  }, [phase.kind, ask]);
   const update = useCallback((holder: HolderState) => {
     if (latest.current) setVault({ ...latest.current.vault, holder });
   }, [setVault]);
@@ -211,6 +234,24 @@ export default function App() {
           onOpen={async (next) => open(next, envelope.current?.v === 1 ? await lockVault(next) : null)}
           onStartAgain={() => setPhase({ kind: "setup", carry: emptyHolder })}
         />
+      </main>
+    );
+
+  if (ask)
+    return (
+      <main className="app">
+        {ask.ok ? (
+          <AskScreen ask={ask.request} preview={answerFor(allow(state, ask.request, nowIso()), ask.request, Date.now())} onAllow={allowAsk} onDecline={declineAsk} alreadyAllowed={alreadyAllowed(state, ask.request)} />
+        ) : (
+          <div className="screen">
+            <h1 className="h1 sm">Album can't answer this</h1>
+            <p className="small">{ask.reason}</p>
+            <p className="small soft">Nothing was sent anywhere.</p>
+            <button type="button" className="btn" onClick={() => setAsk(null)}>
+              Go to my Album
+            </button>
+          </div>
+        )}
       </main>
     );
 
@@ -950,6 +991,80 @@ function ResetAlbum({ update }: { update: Update }) {
         </button>
         <button type="button" className="btn small second" style={{ width: "auto" }} onClick={() => setConfirm(false)}>
           Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AskScreen({ ask, preview, onAllow, onDecline, alreadyAllowed }: {
+  ask: { name: string; place: string; slugs: string[] };
+  preview: { ok: true; cards: PlugCard[] } | { ok: false };
+  onAllow: () => Promise<void>; onDecline: () => void; alreadyAllowed: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const cards = preview.ok ? preview.cards : [];
+  if (alreadyAllowed)
+    return (
+      <div className="screen">
+        <p className="soft">Sending {ask.name} what you already allowed…</p>
+      </div>
+    );
+  return (
+    <div className="screen" style={{ gap: 20, paddingTop: 40 }}>
+      <div className="col" style={{ gap: 8 }}>
+        <span className="small soft">{ask.name} asks</span>
+        <h1 className="h1 sm">
+          {cards.length === 0 ? "Can it check for your cards?" : cards.length === 1 ? "Can it see your " + cards[0].title + " card?" : "Can it see " + cards.length + " of your cards?"}
+        </h1>
+        <span className="tiny soft">
+          The answer goes to <strong style={{ color: "#16181D" }}>{ask.place}</strong>. Check that's the app you expect.
+        </span>
+      </div>
+
+      {cards.length > 0 ? (
+        <div className="stack">
+          {cards.map((card) => (
+            <div key={card.cardId} className="row panel" style={{ flexDirection: "row", padding: 14 }}>
+              <div className="col" style={{ gap: 3 }}>
+                <span style={{ fontSize: 16, fontWeight: 600 }}>{card.title}</span>
+                <span className="small soft">{card.issuerLabel}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="small">You don't hold any of the cards it asked about. If you say yes, it learns only that.</p>
+      )}
+
+      <div className="grid">
+        <div className="col" style={{ gap: 8 }}>
+          <h2 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>It will see</h2>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 14, lineHeight: 1.6 }}>
+            <li>Each card's name</li>
+            <li>Its stage</li>
+            <li>What kind of issuer</li>
+            <li>Whether it's still valid</li>
+          </ul>
+        </div>
+        <div className="col" style={{ gap: 8 }}>
+          <h2 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>It won't see</h2>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 14, lineHeight: 1.6 }}>
+            <li>Your card keys</li>
+            <li>What a card says</li>
+            <li>Any other card</li>
+          </ul>
+        </div>
+      </div>
+
+      <p className="small soft">It can check these again later without asking. Anything else, it has to ask for. You can stop it under Apps.</p>
+
+      <div className="stack">
+        <button type="button" className="btn" disabled={busy} onClick={async () => { setBusy(true); await onAllow(); }}>
+          {busy ? "Sending…" : cards.length === 0 ? "Yes, tell it" : "Show it " + (cards.length === 1 ? "this card" : "these cards")}
+        </button>
+        <button type="button" className="btn second" disabled={busy} onClick={onDecline}>
+          Don't show it
         </button>
       </div>
     </div>

@@ -27,6 +27,7 @@
     "src/engine/**/*.ts",
     "src/examples.ts",
     "src/links.ts",
-    "src/vault.ts"
+    "src/vault.ts",
+    "src/bridge.ts"
   ]
 }
