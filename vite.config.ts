@@ -8,5 +8,8 @@ export default defineConfig({
   base: "./",
   plugins: [react(), ...(single ? [viteSingleFile()] : [])],
   define: { __SINGLE__: JSON.stringify(single) },
-  build: { outDir: single ? "dist-single" : "dist" },
+  // The normal build has two pages: Album itself and the check page anyone can use.
+  build: single
+    ? { outDir: "dist-single" }
+    : { outDir: "dist", rollupOptions: { input: { main: "index.html", check: "check.html" } } },
 });

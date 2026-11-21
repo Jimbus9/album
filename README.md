@@ -19,6 +19,7 @@ Cards are issuer-signed Nostr-format events. The card engine in `src/engine/` is
 - Example cards to try it.
 
 - **The bridge for other apps.** An app sends the person to Album with `#ask=` and the cards it wants; Album shows who is asking and where the answer goes; on yes it sends them back with `#album-answer=`. No server. Allowances are kept per app name and site, and can be stopped under Apps. Rules: [docs/bridge.md](docs/bridge.md). Helper to copy into an app: [client/album-ask.mjs](client/album-ask.mjs).
+- **Proving a card to anyone.** A checker opens `check.html` (no Album needed), which gives out a fresh challenge as a QR code or link. The holder's Album, on their yes, signs it with the key the card was given to and gives them a proof to send back. The check page verifies both signatures (the issuer's on the card, the holder's on the challenge), optionally against an issuer key the checker gives, within 10 minutes, once. Rules: [docs/proving.md](docs/proving.md).
 
 ## Not yet
 

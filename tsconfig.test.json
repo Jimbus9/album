@@ -28,6 +28,7 @@
     "src/examples.ts",
     "src/links.ts",
     "src/vault.ts",
-    "src/bridge.ts"
+    "src/bridge.ts",
+    "src/prove.ts"
   ]
 }

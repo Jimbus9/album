@@ -12,6 +12,7 @@ import { LockedScreen, NoScreenshotsNote, SetupScreen } from "./setup";
 import { makePasskey, passkeysPossible, usePasskey } from "./passkey";
 import { ASK_MARK, allow, alreadyAllowed, answerAddress, answerFor, declined, parseAsk, type ParsedAsk } from "./bridge";
 import type { PlugCard } from "./engine/plug";
+import { PROVE_MARK, checkCode, makeProof, parseRequest, proofLink, proofText, type ProveRequest } from "./prove";
 
 type Screen = { name: "album" } | { name: "card"; id: string } | { name: "add" } | { name: "check" } | { name: "apps" };
 type Phase = { kind: "loading" } | { kind: "error" } | { kind: "setup"; carry: HolderState } | { kind: "locked"; envelope: Stored } | { kind: "open" };
@@ -27,17 +28,26 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const pendingLink = useRef<string | null>(null);
   const [ask, setAsk] = useState<ParsedAsk | null>(null);
+  const [prove, setProve] = useState<ProveRequest | "bad" | null>(null);
+  const [linkTick, setLinkTick] = useState(0);
   const latest = useRef<Unlocked | null>(null);
   const envelope = useRef<Stored | null>(null);
 
   useEffect(() => {
-    if (location.hash.startsWith(ASK_MARK)) {
-      setAsk(parseAsk(location.hash));
+    // A link can arrive when Album opens, or while it's already open (an installed app gets only the new #part).
+    const readHash = () => {
+      const hash = location.hash;
+      if (!hash.startsWith(PROVE_MARK) && !hash.startsWith(ASK_MARK) && !hash.startsWith(LINK_MARK)) return;
       history.replaceState(null, "", location.pathname + location.search);
-    } else if (location.hash.startsWith(LINK_MARK)) {
-      pendingLink.current = location.href;
-      history.replaceState(null, "", location.pathname + location.search);
-    }
+      if (hash.startsWith(PROVE_MARK)) setProve(parseRequest(hash) ?? "bad");
+      else if (hash.startsWith(ASK_MARK)) setAsk(parseAsk(hash));
+      else {
+        pendingLink.current = location.href.split("#")[0] + hash;
+        setLinkTick((n) => n + 1);
+      }
+    };
+    readHash();
+    window.addEventListener("hashchange", readHash);
     loadStored()
       .then((stored) => {
         if (stored.kind === "vault") {
@@ -54,7 +64,10 @@ export default function App() {
     askToKeepStorage();
     const onPop = (event: PopStateEvent) => setScreen((event.state as Screen | null) ?? { name: "album" });
     window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      window.removeEventListener("hashchange", readHash);
+    };
   }, []);
 
   const lock = useCallback(() => {
@@ -174,7 +187,7 @@ export default function App() {
       const problem = receive(link);
       if (problem) setNotice(problem);
     }
-  }, [phase.kind, receive]);
+  }, [phase.kind, receive, linkTick]);
 
   const state = unlocked?.vault.holder ?? null;
   const views = useMemo(() => (state ? viewCards(state, Date.now()) : []), [state]);
@@ -237,11 +250,27 @@ export default function App() {
       </main>
     );
 
+  if (prove)
+    return (
+      <main className="app">
+        {prove === "bad" ? (
+          <div className="screen">
+            <h1 className="h1 sm">Album can't read this request</h1>
+            <p className="small">Ask whoever is checking to make a new one. Nothing was signed.</p>
+            <button type="button" className="btn" onClick={() => setProve(null)}>
+              Go to my Album
+            </button>
+          </div>
+        ) : (
+          <ProveScreen key={prove.challenge} request={prove} state={state} views={views} onDone={() => setProve(null)} />
+        )}
+      </main>
+    );
   if (ask)
     return (
       <main className="app">
         {ask.ok ? (
-          <AskScreen ask={ask.request} preview={answerFor(allow(state, ask.request, nowIso()), ask.request, Date.now())} onAllow={allowAsk} onDecline={declineAsk} alreadyAllowed={alreadyAllowed(state, ask.request)} />
+          <AskScreen key={ask.request.state} ask={ask.request} preview={answerFor(allow(state, ask.request, nowIso()), ask.request, Date.now())} onAllow={allowAsk} onDecline={declineAsk} alreadyAllowed={alreadyAllowed(state, ask.request)} />
         ) : (
           <div className="screen">
             <h1 className="h1 sm">Album can't answer this</h1>
@@ -967,6 +996,10 @@ function AppsScreen({ state, views, update, setNotice, vault, setVault, lock, ch
         )}
       </section>
 
+      <a className="btn second" href="./check.html" style={{ textDecoration: "none" }}>
+        Check someone else's card
+      </a>
+
       <p className="tiny soft">Album keeps everything on this phone, locked, and talks to no server. It locks itself after five minutes out of sight. Early build, not yet reviewed.</p>
       {state.cards.length === 0 && state.keys.length === 0 ? null : <ResetAlbum update={update} />}
     </div>
@@ -991,6 +1024,98 @@ function ResetAlbum({ update }: { update: Update }) {
         </button>
         <button type="button" className="btn small second" style={{ width: "auto" }} onClick={() => setConfirm(false)}>
           Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ProveScreen({ request, state, views, onDone }: { request: ProveRequest; state: HolderState; views: CardView[]; onDone: () => void }) {
+  const eligible = views.filter((view) => view.held.status === "held" && view.card && view.checks.signature === "valid" && view.checks.holderKey === "yours");
+  const matching = request.slug ? eligible.filter((view) => view.card!.slug === request.slug) : eligible;
+  const [picked, setPicked] = useState<string | null>(matching.length === 1 ? matching[0].id : null);
+  const [made, setMade] = useState<{ text: string; link: string } | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const checkUrl = new URL("./check.html", location.href).toString();
+  const prove = () => {
+    if (!picked) return;
+    const result = makeProof(state, picked, request, Math.floor(Date.now() / 1000));
+    if (!result.ok) return setProblem(result.reason);
+    setMade({ text: proofText(result.bundle), link: proofLink(checkUrl, result.bundle) });
+  };
+  const send = async () => {
+    if (!made) return;
+    try {
+      if (navigator.share) await navigator.share({ title: "My card proof", url: made.link });
+      else {
+        await navigator.clipboard.writeText(made.link);
+        setCopied(true);
+      }
+    } catch {
+      /* closed */
+    }
+  };
+  const copy = async () => {
+    if (!made) return;
+    try {
+      await navigator.clipboard.writeText(made.text);
+      setCopied(true);
+    } catch {
+      setProblem("Album couldn't copy. Use Send instead.");
+    }
+  };
+  if (made)
+    return (
+      <div className="screen">
+        <h1 className="h1 sm">Proof ready</h1>
+        <p className="small">Send it back to {request.audience}. It works once, for the next 10 minutes, and only for them.</p>
+        <button type="button" className="btn" onClick={send}>
+          Send it
+        </button>
+        <button type="button" className="btn second" onClick={copy}>
+          {copied ? "Copied" : "Copy it"}
+        </button>
+        {problem && <p className="small" style={{ color: "#A3111D" }}>{problem}</p>}
+        <button type="button" className="btn danger" style={{ color: "#16181D" }} onClick={onDone}>
+          Back to my Album
+        </button>
+      </div>
+    );
+  return (
+    <div className="screen" style={{ gap: 20, paddingTop: 40 }}>
+      <div className="col" style={{ gap: 8 }}>
+        <span className="small soft">{request.audience} asks</span>
+        <h1 className="h1 sm">Prove you hold a card?</h1>
+        <span className="tiny soft">Check code <strong className="mono" style={{ color: "#16181D", fontSize: 14 }}>{checkCode(request.challenge)}</strong>. It should match the code on their screen.</span>
+      </div>
+      {matching.length === 0 ? (
+        <p className="small">{request.slug ? "You don't hold the card they asked about." : "You don't have a card you can prove yet."}</p>
+      ) : (
+        <fieldset className="stack" style={{ border: "none", padding: 0, margin: 0 }}>
+          <legend className="small" style={{ fontWeight: 600, marginBottom: 8 }}>Which card?</legend>
+          {matching.map((view) => (
+            <label key={view.id} className="row panel" style={{ flexDirection: "row", padding: 14, cursor: "pointer", borderColor: picked === view.id ? "#16181D" : undefined }}>
+              <input type="radio" name="card" checked={picked === view.id} onChange={() => setPicked(view.id)} style={{ width: 22, height: 22, accentColor: "#16181D" }} />
+              <span className="col" style={{ gap: 3 }}>
+                <span style={{ fontSize: 16, fontWeight: 600 }}>{view.card!.definition.title}</span>
+                <span className="small soft">{view.checks.issuerLabel}</span>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      )}
+      <div className="know" style={{ cursor: "default" }}>
+        {Icon.info()}
+        <span className="small">They'll see this card, what it says, who issued it, and the card key it was given to. Not your other cards, not your words. Your key for this issuer is used only for this issuer's cards, so it doesn't link to anything else.</span>
+      </div>
+      {problem && <p className="small" style={{ color: "#A3111D" }} role="alert">{problem}</p>}
+      <div className="stack">
+        <button type="button" className="btn" disabled={!picked} onClick={prove}>
+          Prove it
+        </button>
+        <button type="button" className="btn second" onClick={onDone}>
+          Don't
         </button>
       </div>
     </div>
